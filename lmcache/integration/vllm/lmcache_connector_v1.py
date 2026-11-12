@@ -156,7 +156,9 @@ class LMCacheConnectorV1Dynamic(KVConnectorBase_V1, SupportsHMA):
 
         Args:
             forward_context (ForwardContext): the forward context.
-            **kwargs: additional arguments for the load operation
+            **kwargs: Additional load arguments. An optional
+                ``selected_prefill_step`` can retain main KV sources for
+                another consumer while native loads proceed.
 
         Note:
             The number of elements in kv_caches and layer_names should be

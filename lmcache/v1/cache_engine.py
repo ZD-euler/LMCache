@@ -107,6 +107,7 @@ from lmcache.v1.kv_layer_groups import (
     resolve_kv_group_num_layers,
     validate_two_group_layer_counts,
 )
+from lmcache.v1.selected_prefill import SelectedPrefillStep
 from lmcache.v1.sampled_lookup import (
     find_last_sampled_hit,
     first_last_layer_keys,
@@ -7881,6 +7882,8 @@ class LMCacheEngine:
         self,
         tokens: Union[torch.Tensor, list[int]],
         mask: Optional[torch.Tensor] = None,
+        *,
+        selected_prefill_step: SelectedPrefillStep | None = None,
         **kwargs,
     ) -> Generator[Optional[torch.Tensor], Any, None]:
         """
@@ -7891,6 +7894,10 @@ class LMCacheEngine:
         :param Optional[torch.Tensor] mask: The mask for the tokens. Should
             have the same length as tokens. And the mask should ALWAYS be like
             FFFFFTTTTTTT, where True means the tokens needs to be matched.
+
+        :param selected_prefill_step: Optional handle for capturing local
+            Group-0 sources while the deferred retriever still owns them.
+            This handoff leaves normal bank submissions in place.
 
         :param **kwargs: The additional arguments for the storage backend which
             will be passed into the gpu_connector.
@@ -8743,7 +8750,14 @@ class LMCacheEngine:
                     and kwargs.get("prefill_dma_block_ids_by_bank") is not None
                     and getattr(self.metadata, "indexer_c8_layout", None) is not None
                 )
-                sources_safe_to_release = prepare_c8_packets
+                capture_selected_source = (
+                    selected_prefill_step is not None
+                    and kv_group == 0
+                    and self.metadata.world_size == 1
+                    and selected_prefill_step.requests_source(req_id)
+                )
+                prepare_all_layers = prepare_c8_packets or capture_selected_source
+                sources_safe_to_release = prepare_all_layers
                 consumer_failed = False
                 pending_gets: list[tuple[str, Any]] = []
                 to_count_down: list[MemoryObj] = []
@@ -8762,12 +8776,11 @@ class LMCacheEngine:
                     retrieved_by_location.clear()
 
                 try:
-                    prepared_c8_sources = None
-                    if prepare_c8_packets:
-                        # Packet offsets depend on physical page capacity,
-                        # including retained partial tails. Resolve all owners
-                        # before the first forward yield so callbacks only submit.
-                        prepared_c8_sources = []
+                    prepared_sources: list[list[MemoryObj]] | None = None
+                    if prepare_all_layers:
+                        # Both C8 packet planning and selected-source handoff
+                        # need every layer resolved before the first bank write.
+                        prepared_sources = []
                         for layer_id in range(num_layers):
                             row = []
                             for segment, get_generator in zip(
@@ -8783,29 +8796,45 @@ class LMCacheEngine:
                                 pending_gets.remove(pending_get)
                                 if len(objects) != len(segment[1]):
                                     raise RuntimeError(
-                                        "Incomplete C8 prefill source layer: "
+                                        "Incomplete prepared prefill source layer: "
                                         f"req_id={req_id}, layer={layer_id}"
                                     )
                                 row.extend(objects)
-                            prepared_c8_sources.append(row)
+                            prepared_sources.append(row)
+                    if capture_selected_source:
+                        assert selected_prefill_step is not None
+                        assert prepared_sources is not None
+                        selected_prefill_step.stage(
+                            req_id, starts, ends, prepared_sources, to_count_down
+                        )
                     mem_obj_consumer = self.gpu_connector.batched_to_gpu(
-                        starts, ends, **kwargs,
-                        **({"prefill_c8_memory_objs": prepared_c8_sources}
-                           if prepared_c8_sources is not None else {}),
+                        starts,
+                        ends,
+                        **kwargs,
+                        **(
+                            {"prefill_c8_memory_objs": prepared_sources}
+                            if prepare_c8_packets
+                            else {}
+                        ),
                     )
-                    next(mem_obj_consumer)
-                    if prepared_c8_sources is not None:
+                    if prepare_all_layers:
                         sources_safe_to_release = False
+                    try:
+                        next(mem_obj_consumer)
+                    except BaseException:
+                        consumer_failed = prepare_all_layers
+                        raise
+                    if prepared_sources is not None:
                         try:
                             yield from self._submit_prepared_shared_prefill_layers(
-                                mem_obj_consumer, prepared_c8_sources, ret_mask
+                                mem_obj_consumer, prepared_sources, ret_mask
                             )
                         except BaseException:
                             consumer_failed = True
                             raise
 
                     for layer_id in range(
-                        0 if prepared_c8_sources is not None else num_layers
+                        0 if prepared_sources is not None else num_layers
                     ):
                         layer_gets = []
                         for segment, get_generator in zip(

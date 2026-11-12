@@ -90,6 +90,7 @@ from lmcache.v1.manager import LMCacheManager
 from lmcache.v1.prefill_kv_hash import kv_hash_enabled
 from lmcache.v1.prefill_audit import audit_enabled
 from lmcache.v1.prefill_metadata import PrefillMetadataCache
+from lmcache.v1.selected_prefill import SelectedPrefillStep
 
 if TYPE_CHECKING:
     # Third Party
@@ -8542,8 +8543,21 @@ class LMCacheConnectorV1Impl:
             raise
 
     @_lmcache_nvtx_annotate
-    def start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
-        """Start this step's KV loads and atomically discard partial setup."""
+    def start_load_kv(
+        self,
+        forward_context: "ForwardContext",
+        *,
+        selected_prefill_step: SelectedPrefillStep | None = None,
+        **kwargs,
+    ) -> None:
+        """Start this step's KV loads and atomically discard partial setup.
+
+        An optional selected prefill handle observes local main KV objects
+        prepared by the existing retrieval path. Native loads still execute.
+        """
+        if selected_prefill_step is not None:
+            selected_prefill_step.begin()
+            kwargs["selected_prefill_step"] = selected_prefill_step
         started = (
             time.perf_counter()
             if self._layerwise_prefill_p_node and prefill_start_timing_enabled()
@@ -8552,8 +8566,15 @@ class LMCacheConnectorV1Impl:
         status = "ok"
         try:
             self._start_load_kv(forward_context, **kwargs)
+            if selected_prefill_step is not None:
+                selected_prefill_step.seal()
         except BaseException:
             status = "error"
+            if selected_prefill_step is not None:
+                try:
+                    selected_prefill_step.release()
+                except Exception:
+                    logger.exception("Failed to release staged prefill sources")
             metadata = self._parent._get_connector_metadata()
             assert isinstance(metadata, LMCacheConnectorMetadata)
             self._abort_layerwise_retrieve_step(
@@ -8571,7 +8592,13 @@ class LMCacheConnectorV1Impl:
                     logger, "start_load_kv_total", started, status=status,
                 )
 
-    def _start_load_kv(self, forward_context: "ForwardContext", **kwargs) -> None:
+    def _start_load_kv(
+        self,
+        forward_context: "ForwardContext",
+        *,
+        selected_prefill_step: SelectedPrefillStep | None = None,
+        **kwargs,
+    ) -> None:
         """Start loading the KV cache from the connector buffer to vLLM's
         paged KV buffer.
 
@@ -9371,6 +9398,15 @@ class LMCacheConnectorV1Impl:
                         shared_cpu_request_preflight_state=dense_preflight_state,
                         _retain_shared_dense_cache=retain_dense_seed,
                         **deferred_prefill_kwargs,
+                        **(
+                            {"selected_prefill_step": selected_prefill_step}
+                            if selected_prefill_step is not None
+                            and self._layerwise_prefill_p_node
+                            and dsa_two_groups
+                            and self._deferred_layerwise_prefill_load_active
+                            and self._vllm_config.parallel_config.tensor_parallel_size == 1
+                            else {}
+                        ),
                         **(
                             {"prefill_dma_block_ids_by_bank":
                              self._layerwise_prefill_dma_block_ids(request, 0),
